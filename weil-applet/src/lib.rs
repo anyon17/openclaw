@@ -2,30 +2,46 @@
 //!
 //! OpenClaw reimplemented as a Weilliptic smart-contract applet.
 //!
+//! ## Query / Mutate discipline
+//!
+//! `#[mutate]` runs on **all** pod members and must be deterministic.
+//! LLM / cerebrum calls are non-deterministic, so they live exclusively in
+//! `#[query]` methods (single-pod execution, no state commit).
+//!
+//! Typical call sequence for a conversation turn:
+//! ```text
+//!  1. [query]  send_message(…)             → AgentResponse { reply, task_id }
+//!  2. [mutate] append_message(session_key, User,      user_text)
+//!  3. [mutate] append_message(session_key, Assistant, reply)
+//!  4. [mutate] store_task_record(session_key, task_id, user_text, reply)
+//! ```
+//!
 //! ## Architecture
 //!
 //! ```text
 //!  Caller (channel / UI)
 //!        │
+//!        │ ① query
 //!        ▼
-//!  OpenClawState  ◄────────────────────────────────────────────────────┐
-//!  (this contract)                                                      │
-//!        │                                                              │
-//!        │  send_message / run_workflow / run_pipeline / run_cron       │
-//!        │                                                              │
-//!        ▼                                                              │
-//!  cerebrum::Driver  ──── LLM (model + model_key) ────────────────────►│
-//!        │                                                              │
-//!        │  tool calls via Runtime::call_contract                       │
-//!        ▼                                                              │
-//!  MCP Contract  (external agent, or this contract when self-hosted)   ─┘
-//!  tools() / prompts() / web_fetch / recall_memory / …
+//!  OpenClawState  (this contract)
+//!        │
+//!        │ Driver / ChainWithAgents / Pipeline   [query only]
+//!        ▼
+//!  cerebrum::Driver ──── LLM ────────────────────────────────────────────►
+//!        │
+//!        │ tool calls via Runtime::call_contract
+//!        ▼
+//!  MCP Contract  (external, or this contract for built-in read-only tools)
+//!
+//!        │ ② mutate  (after query returns)
+//!        ▼
+//!  OpenClawState  (append_message / store_task_record / touch_cron / …)
 //! ```
 //!
 //! ## WeilId allocation
 //!
-//! IDs 1-9 are reserved for cerebrum internals (Memory uses 1+2,
-//! Actions uses 1+2+3, AgentRegistry uses 1).  This applet starts at 10.
+//! IDs 1-9 are reserved for cerebrum internals (Memory 1+2, Actions 1+2+3,
+//! AgentRegistry 1).  This applet starts at 10.
 //!
 //! | WeilId | Collection |
 //! |--------|-----------|
@@ -77,14 +93,13 @@ pub struct OpenClawState {
     pub config: AppletConfig,
 
     /// Conversation transcripts keyed by session_key.
-    /// The full Vec is serialised as a single JSON value inside the WeilMap.
     pub sessions: WeilMap<String, Vec<ConversationMessage>>,
-    /// Ordered list of all session keys for iteration / list_sessions.
+    /// Insertion-ordered session keys for list_sessions.
     pub session_keys: Vec<String>,
 
     /// Cron job definitions.
     pub cron_jobs: WeilMap<String, CronJob>,
-    /// Ordered list of all cron ids for iteration / list_crons.
+    /// Insertion-ordered cron ids for list_crons.
     pub cron_ids: Vec<String>,
 
     /// Per-caller flat key-value memory.  Keys are "{caller_addr}:{user_key}".
@@ -95,7 +110,7 @@ pub struct OpenClawState {
 
     /// Named external MCP agent registry.  Key = friendly name, value = contract address.
     pub agent_registry: WeilMap<String, String>,
-    /// Ordered list of registered agent names.
+    /// Insertion-ordered agent names for list_agents.
     pub agent_names: Vec<String>,
 }
 
@@ -111,22 +126,19 @@ trait OpenClaw {
 
     fn configure(&mut self, config: AppletConfig) -> Result<(), String>;
 
-    // --- agent registry -----------------------------------------------------
+    // --- agent registry (mutate — deterministic) ----------------------------
     fn register_agent(&mut self, name: String, contract_address: String) -> Result<(), String>;
     fn unregister_agent(&mut self, name: String) -> Result<(), String>;
     fn list_agents(&self) -> Result<String, String>;
 
-    // --- core AI interaction ------------------------------------------------
-    /// Send a message to the AI and receive a response.
-    ///
-    /// Recent conversation history is prepended to the task description so the
-    /// LLM maintains context across multiple turns.
-    ///
-    /// `mcp_contract_address` — address of the MCP contract to use for tools.
-    /// When `None` the contract uses itself (`Runtime::contract_id()`), which
-    /// exposes the built-in read-only tools declared in `tools()`.
+    // --- core AI interaction (query — non-deterministic LLM call) -----------
+    /// Call the LLM and return the reply.  Does NOT write to state.
+    /// After the caller receives the response it should call:
+    ///   `append_message(session_key, User, message)`
+    ///   `append_message(session_key, Assistant, reply)`
+    ///   `store_task_record(session_key, task_id, message, reply)`
     async fn send_message(
-        &mut self,
+        &self,
         session_key: String,
         message: String,
         mcp_contract_address: Option<String>,
@@ -134,30 +146,49 @@ trait OpenClaw {
         model_key: Option<String>,
     ) -> Result<AgentResponse, String>;
 
-    // --- multi-agent chain --------------------------------------------------
-    /// Run a sequential chain of tasks where each task's output feeds the next.
-    async fn run_workflow(
+    // --- transcript persistence (mutate — deterministic) --------------------
+    /// Append one message to a session transcript.
+    fn append_message(
         &mut self,
+        session_key: String,
+        role: ConversationRole,
+        content: String,
+    ) -> Result<(), String>;
+
+    /// Persist the outcome of a `send_message` call in the task log.
+    fn store_task_record(
+        &mut self,
+        session_key: String,
+        task_id: String,
+        description: String,
+        response: String,
+    ) -> Result<(), String>;
+
+    // --- multi-agent chain (query — non-deterministic) ----------------------
+    /// Run a sequential chain of tasks.  Does NOT write to state.
+    async fn run_workflow(
+        &self,
         tasks: Vec<WorkflowTask>,
         model: Option<String>,
         model_key: Option<String>,
     ) -> Result<WorkflowResult, String>;
 
-    // --- DAG pipeline -------------------------------------------------------
-    /// Execute a directed acyclic graph (DAG) of tasks with conditional edges.
+    // --- DAG pipeline (query — non-deterministic) ---------------------------
+    /// Execute a directed acyclic graph of tasks.  Does NOT write to state.
     async fn run_pipeline(
-        &mut self,
+        &self,
         spec: PipelineSpec,
         model: Option<String>,
         model_key: Option<String>,
     ) -> Result<String, String>;
 
-    // --- session management -------------------------------------------------
+    // --- session management (mixed) -----------------------------------------
     fn get_transcript(&self, session_key: String) -> Result<Vec<ConversationMessage>, String>;
     fn clear_session(&mut self, session_key: String) -> Result<(), String>;
     fn list_sessions(&self) -> Result<Vec<String>, String>;
 
     // --- cron / scheduled tasks ---------------------------------------------
+    /// Register a new scheduled task (mutate — deterministic).
     fn create_cron(
         &mut self,
         cron_id: String,
@@ -166,27 +197,31 @@ trait OpenClaw {
         every_ms: u64,
     ) -> Result<(), String>;
 
-    /// Execute a cron job on demand (the platform calls this on schedule).
+    /// Execute a cron job on demand (query — non-deterministic LLM call).
+    /// Does NOT update `last_run_timestamp`; call `touch_cron` afterwards.
     async fn run_cron(
-        &mut self,
+        &self,
         cron_id: String,
         model: Option<String>,
         model_key: Option<String>,
     ) -> Result<String, String>;
 
+    /// Update a cron job's last-run timestamp (mutate — deterministic).
+    fn touch_cron(&mut self, cron_id: String) -> Result<(), String>;
+
     fn delete_cron(&mut self, cron_id: String) -> Result<(), String>;
     fn list_crons(&self) -> Result<Vec<CronJob>, String>;
 
-    // --- per-caller memory --------------------------------------------------
+    // --- per-caller memory (mutate / query) ---------------------------------
     fn remember(&mut self, key: String, value: String) -> Result<(), String>;
     fn recall(&self, key: String) -> Result<Option<String>, String>;
     fn forget(&mut self, key: String) -> Result<bool, String>;
 
-    // --- task history -------------------------------------------------------
+    // --- task history (query) -----------------------------------------------
     fn get_task_history(&self, session_key: String) -> Result<Vec<TaskRecord>, String>;
 
-    // --- MCP interface (built-in tools exposed to other contracts) -----------
-    /// HTTP fetch tool.  Called by the cerebrum Driver during agentic loops.
+    // --- MCP built-in tools (query — safe for agentic loops) ----------------
+    /// HTTP fetch.  Name matches entry in `tools()` schema: "web_fetch".
     async fn web_fetch(
         &self,
         url: String,
@@ -194,16 +229,16 @@ trait OpenClaw {
         body: Option<String>,
     ) -> Result<String, String>;
 
-    /// Memory recall tool.  Called by the cerebrum Driver; scoped to caller.
+    /// Caller-scoped memory recall.  Name: "recall_memory".
     fn recall_memory(&self, key: String) -> Result<Option<String>, String>;
 
-    /// Return the JSON tool schema array for this contract's built-in tools.
+    /// JSON tool schema array for this contract's MCP server role.
     fn tools(&self) -> String;
 
-    /// Return the system-prompt context for this contract's MCP server role.
+    /// System-prompt string for this contract's MCP server role.
     fn prompts(&self) -> String;
 
-    // --- status -------------------------------------------------------------
+    // --- status (query) -----------------------------------------------------
     fn status(&self) -> Result<AppletStatus, String>;
 }
 
@@ -224,7 +259,6 @@ impl OpenClaw for OpenClawState {
         if let Some(prompt) = system_prompt {
             config.system_prompt = prompt;
         }
-
         Ok(OpenClawState {
             config,
             sessions: WeilMap::new(ID_SESSIONS),
@@ -238,7 +272,7 @@ impl OpenClaw for OpenClawState {
         })
     }
 
-    // ---- configuration -----------------------------------------------------
+    // ---- configuration (mutate) --------------------------------------------
 
     #[mutate]
     fn configure(&mut self, config: AppletConfig) -> Result<(), String> {
@@ -246,7 +280,7 @@ impl OpenClaw for OpenClawState {
         Ok(())
     }
 
-    // ---- agent registry ----------------------------------------------------
+    // ---- agent registry (mutate) -------------------------------------------
 
     #[mutate]
     fn register_agent(&mut self, name: String, contract_address: String) -> Result<(), String> {
@@ -282,11 +316,11 @@ impl OpenClaw for OpenClawState {
         serde_json::to_string(&agents).map_err(|e| e.to_string())
     }
 
-    // ---- core AI interaction -----------------------------------------------
+    // ---- core AI interaction (query) ---------------------------------------
 
-    #[mutate]
+    #[query]
     async fn send_message(
-        &mut self,
+        &self,
         session_key: String,
         message: String,
         mcp_contract_address: Option<String>,
@@ -296,63 +330,69 @@ impl OpenClaw for OpenClawState {
         let caller = Runtime::sender();
         let task_id = Runtime::uuid();
         let model = model.unwrap_or_else(|| self.config.default_model.clone());
-        let mcp_addr = mcp_contract_address
-            .unwrap_or_else(|| Runtime::contract_id());
+        let mcp_addr = mcp_contract_address.unwrap_or_else(|| Runtime::contract_id());
 
-        // Build task description that includes recent conversation history.
+        // Build task description incorporating recent conversation history.
         let history = self.sessions.get(&session_key).unwrap_or_default();
-        let task_description = build_task_description(
-            &message,
-            &history,
-            self.config.max_history_turns,
-        );
+        let task_description = build_task_description(&message, &history, self.config.max_history_turns);
 
-        // Append the user turn to the transcript before calling the LLM so
-        // that even a failed run leaves a trace.
-        let user_msg = ConversationMessage {
-            role: ConversationRole::User,
-            content: message.clone(),
-            timestamp: Runtime::block_timestamp(),
-        };
-        append_to_session(&mut self.sessions, &mut self.session_keys, &session_key, user_msg);
-
-        // Run the agentic loop via cerebrum Driver.
         let task = TaskWithAgent::new(task_id.clone(), task_description, mcp_addr);
-        let reply = Driver::do_task_with_agent(caller.clone(), task, model.clone(), model_key)
+        let reply = Driver::do_task_with_agent(caller, task, model.clone(), model_key)
             .await
             .map_err(|e| format!("Agent execution failed: {}", e))?;
 
-        // Append the assistant turn.
-        let assistant_msg = ConversationMessage {
-            role: ConversationRole::Assistant,
-            content: reply.clone(),
-            timestamp: Runtime::block_timestamp(),
-        };
-        append_to_session(&mut self.sessions, &mut self.session_keys, &session_key, assistant_msg);
-
-        // Record in task history.
-        let record = TaskRecord {
-            task_id: task_id.clone(),
-            session_key: session_key.clone(),
-            description: message,
-            response: reply.clone(),
-            timestamp: Runtime::block_timestamp(),
-        };
-        append_to_task_history(&mut self.task_history, &session_key, record);
-
-        Ok(AgentResponse {
-            reply,
-            task_id,
-            session_key,
-            model_used: model,
-        })
+        Ok(AgentResponse { reply, task_id, session_key, model_used: model })
     }
 
-    // ---- multi-agent chain -------------------------------------------------
+    // ---- transcript persistence (mutate) -----------------------------------
 
     #[mutate]
-    async fn run_workflow(
+    fn append_message(
         &mut self,
+        session_key: String,
+        role: ConversationRole,
+        content: String,
+    ) -> Result<(), String> {
+        let msg = ConversationMessage {
+            role,
+            content,
+            timestamp: Runtime::block_timestamp(),
+        };
+        let mut transcript = self.sessions.get(&session_key).unwrap_or_default();
+        transcript.push(msg);
+        self.sessions.insert(session_key.clone(), transcript);
+        if !self.session_keys.contains(&session_key) {
+            self.session_keys.push(session_key);
+        }
+        Ok(())
+    }
+
+    #[mutate]
+    fn store_task_record(
+        &mut self,
+        session_key: String,
+        task_id: String,
+        description: String,
+        response: String,
+    ) -> Result<(), String> {
+        let record = TaskRecord {
+            task_id,
+            session_key: session_key.clone(),
+            description,
+            response,
+            timestamp: Runtime::block_timestamp(),
+        };
+        let mut history = self.task_history.get(&session_key).unwrap_or_default();
+        history.push(record);
+        self.task_history.insert(session_key, history);
+        Ok(())
+    }
+
+    // ---- multi-agent chain (query) -----------------------------------------
+
+    #[query]
+    async fn run_workflow(
+        &self,
         tasks: Vec<WorkflowTask>,
         model: Option<String>,
         model_key: Option<String>,
@@ -366,10 +406,7 @@ impl OpenClaw for OpenClawState {
 
         let mut chain = ChainWithAgents::new();
         for (i, t) in tasks.iter().enumerate() {
-            let task_id = t
-                .task_id
-                .clone()
-                .unwrap_or_else(|| format!("task_{}", i));
+            let task_id = t.task_id.clone().unwrap_or_else(|| format!("task_{}", i));
             chain.add_task(TaskWithAgent::new(
                 task_id,
                 t.description.clone(),
@@ -387,11 +424,11 @@ impl OpenClaw for OpenClawState {
         }
     }
 
-    // ---- DAG pipeline ------------------------------------------------------
+    // ---- DAG pipeline (query) ----------------------------------------------
 
-    #[mutate]
+    #[query]
     async fn run_pipeline(
-        &mut self,
+        &self,
         spec: PipelineSpec,
         model: Option<String>,
         model_key: Option<String>,
@@ -399,17 +436,10 @@ impl OpenClaw for OpenClawState {
         let caller = Runtime::sender();
         let model = model.unwrap_or_else(|| self.config.default_model.clone());
 
-        let mut pipeline = Pipeline::new(
-            spec.name.clone(),
-            spec.description.clone(),
-            spec.is_repeating,
-        );
+        let mut pipeline = Pipeline::new(spec.name.clone(), spec.description.clone(), spec.is_repeating);
 
         for (i, t) in spec.tasks.iter().enumerate() {
-            let task_id = t
-                .task_id
-                .clone()
-                .unwrap_or_else(|| format!("task_{}", i));
+            let task_id = t.task_id.clone().unwrap_or_else(|| format!("task_{}", i));
             pipeline.add_task(TaskWithAgent::new(
                 task_id,
                 t.description.clone(),
@@ -473,22 +503,23 @@ impl OpenClaw for OpenClawState {
         if self.cron_jobs.get(&cron_id).is_some() {
             return Err(format!("Cron job '{}' already exists", cron_id));
         }
-        let job = CronJob {
+        self.cron_jobs.insert(cron_id.clone(), CronJob {
             id: cron_id.clone(),
             description,
             mcp_contract_address,
             every_ms,
             last_run_timestamp: None,
             created_at: Runtime::block_timestamp(),
-        };
-        self.cron_jobs.insert(cron_id.clone(), job);
+        });
         self.cron_ids.push(cron_id);
         Ok(())
     }
 
-    #[mutate]
+    /// Execute a cron job — query only (LLM call is non-deterministic).
+    /// Call `touch_cron(cron_id)` afterwards to persist the last-run timestamp.
+    #[query]
     async fn run_cron(
-        &mut self,
+        &self,
         cron_id: String,
         model: Option<String>,
         model_key: Option<String>,
@@ -501,23 +532,22 @@ impl OpenClaw for OpenClawState {
         let caller = Runtime::sender();
         let model = model.unwrap_or_else(|| self.config.default_model.clone());
 
-        let task_id = Runtime::uuid();
-        let task = TaskWithAgent::new(
-            task_id.clone(),
-            job.description.clone(),
-            job.mcp_contract_address.clone(),
-        );
-
-        let result = Driver::do_task_with_agent(caller, task, model, model_key)
+        let task = TaskWithAgent::new(Runtime::uuid(), job.description.clone(), job.mcp_contract_address.clone());
+        Driver::do_task_with_agent(caller, task, model, model_key)
             .await
-            .map_err(|e| format!("Cron execution failed: {}", e))?;
+            .map_err(|e| format!("Cron execution failed: {}", e))
+    }
 
-        // Update last-run timestamp.
-        let mut updated_job = job;
-        updated_job.last_run_timestamp = Some(Runtime::block_timestamp());
-        self.cron_jobs.insert(cron_id, updated_job);
-
-        Ok(result)
+    /// Record that a cron job ran (mutate — deterministic timestamp update).
+    #[mutate]
+    fn touch_cron(&mut self, cron_id: String) -> Result<(), String> {
+        let mut job = self
+            .cron_jobs
+            .get(&cron_id)
+            .ok_or_else(|| format!("Cron job '{}' not found", cron_id))?;
+        job.last_run_timestamp = Some(Runtime::block_timestamp());
+        self.cron_jobs.insert(cron_id, job);
+        Ok(())
     }
 
     #[mutate]
@@ -532,35 +562,27 @@ impl OpenClaw for OpenClawState {
 
     #[query]
     fn list_crons(&self) -> Result<Vec<CronJob>, String> {
-        let jobs: Vec<CronJob> = self
-            .cron_ids
-            .iter()
-            .filter_map(|id| self.cron_jobs.get(id))
-            .collect();
-        Ok(jobs)
+        Ok(self.cron_ids.iter().filter_map(|id| self.cron_jobs.get(id)).collect())
     }
 
     // ---- per-caller memory -------------------------------------------------
 
     #[mutate]
     fn remember(&mut self, key: String, value: String) -> Result<(), String> {
-        let caller = Runtime::sender();
-        let compound = format!("{}:{}", caller, key);
+        let compound = format!("{}:{}", Runtime::sender(), key);
         self.user_memory.insert(compound, value);
         Ok(())
     }
 
     #[query]
     fn recall(&self, key: String) -> Result<Option<String>, String> {
-        let caller = Runtime::sender();
-        let compound = format!("{}:{}", caller, key);
+        let compound = format!("{}:{}", Runtime::sender(), key);
         Ok(self.user_memory.get(&compound))
     }
 
     #[mutate]
     fn forget(&mut self, key: String) -> Result<bool, String> {
-        let caller = Runtime::sender();
-        let compound = format!("{}:{}", caller, key);
+        let compound = format!("{}:{}", Runtime::sender(), key);
         let existed = self.user_memory.get(&compound).is_some();
         if existed {
             self.user_memory.remove(&compound);
@@ -575,9 +597,9 @@ impl OpenClaw for OpenClawState {
         Ok(self.task_history.get(&session_key).unwrap_or_default())
     }
 
-    // ---- MCP interface (built-in tools for other contracts) ----------------
+    // ---- MCP built-in tools (query) ----------------------------------------
 
-    /// HTTP fetch — exposed as an MCP tool named `web_fetch`.
+    /// HTTP fetch exposed as MCP tool "web_fetch".
     #[query]
     async fn web_fetch(
         &self,
@@ -586,46 +608,37 @@ impl OpenClaw for OpenClawState {
         body: Option<String>,
     ) -> Result<String, String> {
         let http_method = match method.as_deref().unwrap_or("GET") {
-            "POST" => HttpMethod::Post,
-            "PUT" => HttpMethod::Put,
+            "POST"   => HttpMethod::Post,
+            "PUT"    => HttpMethod::Put,
             "DELETE" => HttpMethod::Delete,
-            "PATCH" => HttpMethod::Patch,
-            _ => HttpMethod::Get,
+            "PATCH"  => HttpMethod::Patch,
+            _        => HttpMethod::Get,
         };
-
         let mut builder = HttpClient::request(&url, http_method);
         if let Some(b) = body {
             builder = builder.body(b);
         }
-
-        let response = builder
-            .send()
-            .map_err(|e| format!("HTTP request failed: {}", e))?;
-
-        if response.status() >= 400 {
-            return Err(format!("HTTP error {}: {}", response.status(), response.text()));
+        let resp = builder.send().map_err(|e| format!("HTTP request failed: {}", e))?;
+        if resp.status() >= 400 {
+            return Err(format!("HTTP error {}: {}", resp.status(), resp.text()));
         }
-        Ok(response.text())
+        Ok(resp.text())
     }
 
-    /// Memory recall — exposed as an MCP tool named `recall_memory`.
-    /// Scoped to the current caller address.
+    /// Caller-scoped memory recall exposed as MCP tool "recall_memory".
     #[query]
     fn recall_memory(&self, key: String) -> Result<Option<String>, String> {
-        let caller = Runtime::sender();
-        let compound = format!("{}:{}", caller, key);
+        let compound = format!("{}:{}", Runtime::sender(), key);
         Ok(self.user_memory.get(&compound))
     }
 
-    /// Returns the JSON tool schema array for this contract's built-in tools.
-    /// Called by the cerebrum Driver when this contract is an MCP server.
+    /// JSON tool schema array — called by cerebrum Driver to discover tools.
     #[query]
     fn tools(&self) -> String {
         tool_schema_json()
     }
 
-    /// Returns the system-prompt context string for this contract's MCP role.
-    /// Called by the cerebrum Driver's `get_agent_prompts`.
+    /// System-prompt string — called by cerebrum Driver for MCP context.
     #[query]
     fn prompts(&self) -> String {
         self.config.system_prompt.clone()
@@ -649,7 +662,8 @@ impl OpenClaw for OpenClawState {
 // Private helpers (not WASM exports)
 // ---------------------------------------------------------------------------
 
-/// Build a task description that embeds recent conversation history as context.
+/// Prepend recent conversation history to the current message so the LLM
+/// maintains context across turns.
 fn build_task_description(
     current_message: &str,
     history: &[ConversationMessage],
@@ -658,8 +672,6 @@ fn build_task_description(
     if history.is_empty() {
         return current_message.to_string();
     }
-
-    // Take the last `max_turns` messages; pair User+Assistant turns.
     let start = history.len().saturating_sub(max_turns as usize * 2);
     let recent = &history[start..];
 
@@ -675,30 +687,4 @@ fn build_task_description(
     ctx.push('\n');
     ctx.push_str(&format!("Current message: {}", current_message));
     ctx
-}
-
-/// Append a message to a session's transcript, registering the key when new.
-fn append_to_session(
-    sessions: &mut WeilMap<String, Vec<ConversationMessage>>,
-    session_keys: &mut Vec<String>,
-    session_key: &String,
-    message: ConversationMessage,
-) {
-    let mut transcript = sessions.get(session_key).unwrap_or_default();
-    transcript.push(message);
-    sessions.insert(session_key.clone(), transcript);
-    if !session_keys.contains(session_key) {
-        session_keys.push(session_key.clone());
-    }
-}
-
-/// Append a TaskRecord to the per-session task history.
-fn append_to_task_history(
-    task_history: &mut WeilMap<String, Vec<TaskRecord>>,
-    session_key: &String,
-    record: TaskRecord,
-) {
-    let mut history = task_history.get(session_key).unwrap_or_default();
-    history.push(record);
-    task_history.insert(session_key.clone(), history);
 }

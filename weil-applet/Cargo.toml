@@ -8,10 +8,10 @@ description = "OpenClaw rewritten as a Weilliptic smart contract applet"
 crate-type = ["cdylib"]
 
 [dependencies]
-weil_rs      = { path = "../../contract-sdk/rust/weil_rs" }
-weil_macros  = { path = "../../contract-sdk/rust/weil_rs/weil_macros" }
-w_cerebrum   = { path = "../../contract-sdk/rust/cerebrum" }
-wadk-utils   = { path = "../../wadk-utils" }
+weil_rs      = { path = "../../projects/contract-sdk/rust/weil_rs" }
+weil_macros  = { path = "../../projects/contract-sdk/rust/weil_rs/weil_macros" }
+w_cerebrum   = { path = "../../projects/contract-sdk/rust/cerebrum" }
+wadk-utils   = { path = "../../projects/wadk-utils" }
 anyhow       = "1.0"
 serde        = { version = "1.0", features = ["derive"] }
 serde_json   = "1.0"
